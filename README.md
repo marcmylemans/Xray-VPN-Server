@@ -8,7 +8,7 @@
       TROJAN_PASSWORD="$(openssl rand -base64 24)"
       # ==================================
       
-cloudinit-duckdns-dualstack-qr.yaml.example
+** cloudinit-duckdns-dualstack-qr.yaml.example **
 
 ---
 
