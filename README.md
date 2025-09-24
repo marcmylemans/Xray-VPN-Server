@@ -185,10 +185,16 @@ server {
   root /var/www/html;
   index index.html;
 
-  # Protect /qr with Basic Auth
-  location /qr {
+  # Add this exact-match first: send /qr -> /qr/
+  location = /qr {
+    return 302 /qr/;
+  }
+
+  # Auth-protected directory match (note the trailing slash)
+  location ^~ /qr/ {
     auth_basic "VPN Access";
     auth_basic_user_file /etc/nginx/.htpasswd;
+  
     root /var/www/html;
     index index.html;
   }
