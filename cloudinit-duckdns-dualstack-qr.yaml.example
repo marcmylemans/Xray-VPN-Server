@@ -1,0 +1,298 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - curl
+  - wget
+  - git
+  - ufw
+  - jq
+  - socat
+  - nginx
+  - openssl
+  - qrencode   # for local QR PNG generation (no CDN)
+
+write_files:
+  - path: /etc/vpn.env
+    owner: root:root
+    permissions: '0640'
+    content: |
+      # ==== EDIT THESE BEFORE DEPLOY ====
+      DUCKDNS_SUBDOMAIN="your-subdomain" 
+      DUCKDNS_TOKEN="your-duckdns-token"   # from https://www.duckdns.org/
+      EMAIL="admin@example.com"
+      TROJAN_PASSWORD="$(openssl rand -base64 24)"
+      # ==================================
+      DOMAIN="${DUCKDNS_SUBDOMAIN}.duckdns.org"
+
+  # DuckDNS updater (IPv4 + IPv6)
+  - path: /etc/duckdns.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+      DUCKDNS_SUBDOMAIN="{{DUCKDNS_SUBDOMAIN}}"
+      DUCKDNS_TOKEN="{{DUCKDNS_TOKEN}}"
+
+  - path: /usr/local/bin/duckdns-update.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      source /etc/duckdns.env
+      IPV4="$(curl -4 -fsS https://api.ipify.org || true)"
+      IPV6="$(curl -6 -fsS https://api64.ipify.org || ip -6 addr show scope global | awk '/inet6/{print $2}' | head -n1 | cut -d/ -f1 || true)"
+      URL="https://www.duckdns.org/update?domains=${DUCKDNS_SUBDOMAIN}&token=${DUCKDNS_TOKEN}"
+      [ -n "${IPV4:-}" ] && URL="${URL}&ip=${IPV4}"
+      [ -n "${IPV6:-}" ] && URL="${URL}&ipv6=${IPV6}"
+      OUT="$(curl -fsS "${URL}")" || OUT="KO"
+      echo "$(date -Is) duckdns-update: ${OUT} v4=${IPV4:-NA} v6=${IPV6:-NA}"
+
+  - path: /etc/systemd/system/duckdns-update.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DuckDNS updater (IPv4 + IPv6)
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/duckdns-update.sh
+
+  - path: /etc/systemd/system/duckdns-update.timer
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Run DuckDNS update every 5 minutes
+
+      [Timer]
+      OnBootSec=30sec
+      OnUnitActiveSec=5min
+      Unit=duckdns-update.service
+
+      [Install]
+      WantedBy=timers.target
+
+  # Main bootstrap
+  - path: /usr/local/bin/vpn-bootstrap.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      source /etc/vpn.env
+
+      echo "[1/12] Enable BBR"
+      if ! sysctl net.ipv4.tcp_congestion_control | grep -qi bbr; then
+        sed -i '/^net.core.default_qdisc/d' /etc/sysctl.conf || true
+        sed -i '/^net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf || true
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p
+      fi
+
+      echo "[2/12] Firewall (v4+v6)"
+      ufw allow 22/tcp || true
+      ufw allow 80/tcp || true
+      ufw allow 443/tcp || true
+      yes | ufw enable || true
+
+      echo "[3/12] DuckDNS timer"
+      sed -i "s/{{DUCKDNS_SUBDOMAIN}}/${DUCKDNS_SUBDOMAIN}/" /etc/duckdns.env
+      sed -i "s/{{DUCKDNS_TOKEN}}/${DUCKDNS_TOKEN}/" /etc/duckdns.env
+      systemctl daemon-reload
+      systemctl enable --now duckdns-update.timer
+      systemctl start duckdns-update.service || true
+
+      echo "[4/12] Nginx sites: HTTP redirect + HTTPS fallback"
+      mkdir -p /var/www/html
+      cat >/var/www/html/index.html <<EOF
+      <!doctype html><html><head><meta charset="utf-8"><title>${DOMAIN}</title></head>
+      <body style="font-family:sans-serif"><h1>${DOMAIN}</h1><p>HTTPS placeholder.</p></body></html>
+      EOF
+
+      # Remove Ubuntu default site to avoid default_server clashes
+      rm -f /etc/nginx/sites-enabled/default
+
+      # HTTP :80 → force redirect to HTTPS
+      cat >/etc/nginx/sites-available/00_http_redirect.conf <<'EOF'
+      server {
+        listen 80 default_server;
+        listen [::]:80 default_server;
+        server_name _;
+        return 301 https://$host$request_uri;
+      }
+      EOF
+      ln -sf /etc/nginx/sites-available/00_http_redirect.conf /etc/nginx/sites-enabled/00_http_redirect.conf
+
+      # HTTPS fallback vhost on :8080 (served via Xray TLS fallback)
+      cat >/etc/nginx/sites-available/fallback.conf <<'EOF'
+      server {
+        listen 8080 default_server;
+        listen [::]:8080 default_server;
+        server_name _;
+        root /var/www/html;
+        index index.html;
+
+        # Protect /qr with Basic Auth
+        location /qr {
+          auth_basic "VPN Access";
+          auth_basic_user_file /etc/nginx/.htpasswd;
+          root /var/www/html;
+          index index.html;
+        }
+
+        access_log off;
+        error_log  /var/log/nginx/fallback_error.log;
+        location / { try_files $uri $uri/ =404; }
+      }
+      EOF
+      ln -sf /etc/nginx/sites-available/fallback.conf /etc/nginx/sites-enabled/fallback.conf
+      nginx -t
+      systemctl enable nginx
+      systemctl restart nginx
+
+      echo "[5/12] Install acme.sh"
+      export HOME=/root
+      if [ ! -d "/root/.acme.sh" ] && [ ! -d "/.acme.sh" ]; then
+        curl -s https://get.acme.sh | sh -s email=${EMAIL}
+      fi
+      if [ -d "/.acme.sh" ] && [ ! -d "/root/.acme.sh" ]; then mv /.acme.sh /root/.acme.sh; fi
+      export PATH="$PATH:/root/.acme.sh:/.acme.sh"
+      ACME_BIN="$(command -v acme.sh || true)"
+      if [ -z "$ACME_BIN" ] && [ -x "/root/.acme.sh/acme.sh" ]; then ACME_BIN="/root/.acme.sh/acme.sh"; fi
+      [ -z "$ACME_BIN" ] && { echo "ERROR: acme.sh not found"; exit 1; }
+
+      echo "[6/12] Issue ECDSA cert via DNS-01 (DuckDNS)"
+      # acme.sh expects this exact env var name (case-sensitive)
+      export DuckDNS_Token="${DUCKDNS_TOKEN}"
+      "$ACME_BIN" --set-default-ca --server letsencrypt
+      "$ACME_BIN" --issue -d "${DOMAIN}" --dns dns_duckdns --keylength ec-256 --force
+
+      echo "[7/12] Install cert + reload hook"
+      mkdir -p /etc/xray
+      "$ACME_BIN" --install-cert -d "${DOMAIN}" --ecc \
+        --key-file /etc/xray/tls.key \
+        --fullchain-file /etc/xray/tls.crt \
+        --reloadcmd "systemctl restart xray || true"
+      chmod 600 /etc/xray/tls.*
+
+      echo "[8/12] Install Xray"
+      if ! command -v xray >/dev/null 2>&1; then
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+      fi
+      install -d -m 0755 /usr/local/etc/xray
+
+      echo "[9/12] Xray config (Trojan/TLS, dual-stack, HTTPS fallback)"
+      cat >/usr/local/etc/xray/config.json <<'JSON'
+      {
+        "log": { "loglevel": "warning" },
+        "inbounds": [
+          {
+            "port": 443,
+            "listen": "::",
+            "protocol": "trojan",
+            "settings": {
+              "clients": [ { "password": "__TROJAN_PASSWORD__" } ],
+              "fallbacks": [
+                { "alpn": "http/1.1", "dest": "127.0.0.1:8080" },
+                { "alpn": "h2",       "dest": "127.0.0.1:8080" }
+              ]
+            },
+            "streamSettings": {
+              "network": "tcp",
+              "security": "tls",
+              "tlsSettings": {
+                "alpn": ["http/1.1","h2"],
+                "certificates": [
+                  { "certificateFile": "/etc/xray/tls.crt", "keyFile": "/etc/xray/tls.key" }
+                ]
+              }
+            }
+          }
+        ],
+        "outbounds": [
+          { "protocol": "freedom", "settings": {} },
+          { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
+        ],
+        "routing": { "domainStrategy": "AsIs", "rules": [] }
+      }
+      JSON
+      ESCAPED_PASS="$(printf '%s' "${TROJAN_PASSWORD}" | sed -e 's/[\/&]/\\&/g')"
+      sed -i "s/__TROJAN_PASSWORD__/${ESCAPED_PASS}/" /usr/local/etc/xray/config.json
+
+      echo "[10/12] Secure /qr page (basic-auth + local QR PNG)"
+      # Trojan URL for QR page and file
+      TROJAN_URL="trojan://${TROJAN_PASSWORD}@${DOMAIN}:443?security=tls&type=tcp&sni=${DOMAIN}#Trojan-${DOMAIN}"
+      echo "${TROJAN_URL}" > /root/trojan-url.txt
+
+      # htpasswd (user=vpn), allow nginx (www-data) to read it
+      printf "vpn:%s\n" "$(openssl passwd -apr1 "$TROJAN_PASSWORD")" > /etc/nginx/.htpasswd
+      chown root:www-data /etc/nginx/.htpasswd
+      chmod 640 /etc/nginx/.htpasswd
+
+      # Static QR assets
+      mkdir -p /var/www/html/qr
+      echo "${TROJAN_URL}" > /var/www/html/qr/trojan.txt
+      qrencode -o /var/www/html/qr/trojan.png -s 10 -m 2 "${TROJAN_URL}"
+      chmod 644 /var/www/html/qr/trojan.txt /var/www/html/qr/trojan.png
+
+      # Static HTML (no external JS/CDN)
+      cat >/var/www/html/qr/index.html <<'HTML'
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>VPN QR</title>
+        <style>
+          body{font-family:sans-serif;max-width:720px;margin:40px auto;text-align:center}
+          code{word-break:break-all}
+          img{width:260px;height:260px}
+          button{padding:8px 12px;margin-top:10px}
+        </style>
+      </head>
+      <body>
+        <h1>Trojan QR</h1>
+        <p>Scan this with Hiddify / Shadowrocket / v2rayNG</p>
+        <img src="trojan.png" alt="QR">
+        <p><code id="link"></code></p>
+        <button id="copy">Copy URL</button>
+        <script>
+          fetch('trojan.txt').then(r=>r.text()).then(t=>{
+            const u=t.trim();
+            document.getElementById('link').textContent=u;
+            document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(u);alert('Copied!');}catch(e){alert('Copy failed');}};
+          });
+        </script>
+      </body>
+      </html>
+      HTML
+      systemctl reload nginx
+
+      echo "[11/12] Permissions for Xray service user"
+      SRVUSER="$(systemctl show -p User xray --value)"; [ -z "$SRVUSER" ] && SRVUSER=nobody
+      SRVGROUP="$(systemctl show -p Group xray --value)"
+      if [ -z "$SRVGROUP" ]; then
+        if getent group nogroup >/dev/null 2>&1; then SRVGROUP=nogroup; else SRVGROUP="$SRVUSER"; fi
+      fi
+      chown "$SRVUSER:$SRVGROUP" /etc/xray/tls.key /etc/xray/tls.crt
+      chmod 640 /etc/xray/tls.key /etc/xray/tls.crt
+      chmod 755 /etc/xray
+      chown -R "$SRVUSER:$SRVGROUP" /usr/local/etc/xray
+      chmod 644 /usr/local/etc/xray/config.json
+      chmod 755 /usr/local/etc/xray
+      mkdir -p /etc/systemd/system/xray.service.d
+      cat >/etc/systemd/system/xray.service.d/caps.conf <<'EOF'
+      [Service]
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      EOF
+      systemctl daemon-reload
+
+      echo "[12/12] Enable & start Xray"
+      systemctl enable xray
+      systemctl restart xray
+
+runcmd:
+  - [ bash, -c, "/usr/local/bin/vpn-bootstrap.sh > /root/vpn-bootstrap.log 2>&1" ]
