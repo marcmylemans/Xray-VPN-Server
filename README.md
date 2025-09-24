@@ -1,5 +1,13 @@
 # Using the cloudinit script
 
+
+      # ==== EDIT THESE BEFORE DEPLOY ====
+      DUCKDNS_SUBDOMAIN="your-subdomain" 
+      DUCKDNS_TOKEN="your-duckdns-token"   # from https://www.duckdns.org/
+      EMAIL="admin@example.com"
+      TROJAN_PASSWORD="$(openssl rand -base64 24)"
+      # ==================================
+      
 cloudinit-duckdns-dualstack-qr.yaml.example
 
 ---
