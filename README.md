@@ -2,6 +2,8 @@
 
 cloudinit-duckdns-dualstack-qr.yaml.example
 
+---
+
 # Manual Setup Guide — Trojan (Xray) + TLS + Nginx + DuckDNS + QR page
 
 This README explains **every step** of the cloud-init you shared so that anyone can **manually copy/paste commands** on a fresh Ubuntu VPS and end up with the same result:
