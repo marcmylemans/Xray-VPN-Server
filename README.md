@@ -26,11 +26,9 @@ This README explains **every step** of the cloud-init you shared so that anyone 
 Replace values and paste:
 
 ```bash
-sudo -i
-
 cat >/etc/vpn.env <<'EOF'
 # ==== EDIT THESE BEFORE DEPLOY ====
-DUCKDNS_SUBDOMAIN="your-subdomain"   # e.g. "mylemansvps2"
+DUCKDNS_SUBDOMAIN="your-subdomain" 
 DUCKDNS_TOKEN="your-duckdns-token"   # from https://www.duckdns.org/
 EMAIL="admin@example.com"
 TROJAN_PASSWORD="$(openssl rand -base64 24)"
