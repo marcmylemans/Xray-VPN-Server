@@ -247,11 +247,13 @@ chmod 600 /etc/xray/tls.*
 ```bash
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 install -d -m 0755 /usr/local/etc/xray
+```
 
-10) Xray config (Trojan/TLS, ALPN fallback → Nginx:8080)
+## 9) Xray config (Trojan/TLS, ALPN fallback → Nginx:8080)
 
 Create config and inject your Trojan password:
 
+```bash
 cat >/usr/local/etc/xray/config.json <<'JSON'
 {
   "log": { "loglevel": "warning" },
