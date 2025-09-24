@@ -1,5 +1,12 @@
 # Using the cloudinit script
 
+## 0) Prerequisites
+
+1) A VPS with ports **22**, **80**, **443** reachable (check provider firewall/security groups).  
+2) A **DuckDNS** subdomain + **token**: <https://www.duckdns.org/>  
+3) An email address for Let’s Encrypt notifications.  
+4) A domain you’ll use: `your-subdomain.duckdns.org`.
+
 
       # ==== EDIT THESE BEFORE DEPLOY ====
       DUCKDNS_SUBDOMAIN="your-subdomain" 
@@ -8,7 +15,7 @@
       TROJAN_PASSWORD="$(openssl rand -base64 24)"
       # ==================================
       
-** cloudinit-duckdns-dualstack-qr.yaml.example **
+Copy and past the contents from "cloudinit-duckdns-dualstack-qr.yaml.example"
 
 ---
 
